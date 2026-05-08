@@ -23,21 +23,16 @@ except ModuleNotFoundError:
     Image = None
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SCRIPT_DIR.parent
+GRAPHS_ROOT = SCRIPT_DIR.parent
+REPO_ROOT = GRAPHS_ROOT.parent
 DEFAULT_BANK_ORDER = ["RBC", "BMO", "Scotia", "CIBC", "National Bank", "TD"]
-DEFAULT_INPUT_PATH = (
-    REPO_ROOT
-    / "inputs"
-    / "attributed-growth-by-segment-template"
-    / "attributed_growth_by_segment_template_input.xlsx"
-)
 DEFAULT_OUTPUT_PATH = (
     REPO_ROOT
     / "outputs"
-    / "attributed-growth-by-segment-template"
-    / "attributed_growth_by_segment_template.xlsx"
+    / "attributed-growth-by-segment"
+    / "attributed_growth_by_segment.xlsx"
 )
-DEFAULT_LOGO_DIR = REPO_ROOT / "assets" / "bank-logos"
+DEFAULT_LOGO_DIR = GRAPHS_ROOT / "assets" / "bank-logos"
 DEFAULT_LOGO_FILES = {
     "RBC": "ry.png",
     "BMO": "bmo.png",
@@ -62,14 +57,6 @@ CHART_GEOMETRY = {
     "axis_max_padding": 1.03,
     "zero_line_color": "#8C8C8C",
 }
-INPUT_LAYOUT = {
-    "sheet_name": "Data Input",
-    "segment_start_row": 5,
-    "segment_max_rows": 5,
-    "data_start_row": 12,
-    "data_max_rows": 6,
-    "data_segment_start_col": 3,
-}
 COLUMN_WIDTHS_PX = {
     0: 28,
     **{index: 84 for index in range(1, 14)},
@@ -87,7 +74,7 @@ COLUMN_WIDTHS_PX = {
 }
 DEFAULT_CONFIG = {
     "sectionNumber": "1",
-    "sectionTitle": "Attributed Growth by Segment Template",
+    "sectionTitle": "Attributed Growth by Segment",
     "sheetName": "Attributed Growth",
     "attributedLabel": "Attributed Growth/Contribution",
     "bankOrder": DEFAULT_BANK_ORDER,
@@ -349,62 +336,264 @@ def prepare_config(parsed: dict[str, Any]) -> dict[str, Any]:
     return config
 
 
-def load_config_from_input_workbook(input_path: Path) -> dict[str, Any]:
-    try:
-        from openpyxl import load_workbook
-    except ModuleNotFoundError as exc:
-        raise SystemExit(
-            "Missing dependency: openpyxl. Run: .venv/bin/pip install -r requirements.txt"
-        ) from exc
+def get_format_spec() -> str:
+    """Return the JSON formatting instructions for the upstream LLM step."""
+    return """
+Format the calculation results into one JSON object for an attributed growth by segment chart.
 
-    workbook = load_workbook(input_path, data_only=True)
-    if INPUT_LAYOUT["sheet_name"] not in workbook.sheetnames:
-        raise ValueError(f'Could not find sheet "{INPUT_LAYOUT["sheet_name"]}" in {input_path}')
-    sheet = workbook[INPUT_LAYOUT["sheet_name"]]
-
-    def cell(address: str) -> Any:
-        value = sheet[address].value
-        return value.strip() if isinstance(value, str) else value
-
-    config: dict[str, Any] = {
-        "sectionNumber": cell("B1") or DEFAULT_CONFIG["sectionNumber"],
-        "sectionTitle": cell("B2") or DEFAULT_CONFIG["sectionTitle"],
+Return only JSON. Use this structure:
+{
+  "section_number": "1",
+  "section_title": "Attributed Growth by Segment",
+  "sheet_name": "Attributed Growth",
+  "segment_names": ["CB", "IB", "CM", "WM", "CS + Ins."],
+  "banks": [
+    {
+      "bank": "RBC",
+      "absolute_growth": 7.4,
+      "yoy_pct": 12,
+      "segments": {
+        "CB": 5,
+        "IB": 1,
+        "CM": 3,
+        "WM": 3,
+        "CS + Ins.": 0
+      }
     }
+  ],
+  "attributed_banks": ["National Bank", "TD"]
+}
+
+Field rules:
+- `absolute_growth` is the displayed bank-level absolute growth in $BN.
+- `yoy_pct` is the displayed bank-level YoY growth percentage.
+- Segment values are contribution percentages, not dollar values.
+- Keep bank order in the order the bars should render.
+- Use `0` for zero contribution values so the chart can draw the 0% sliver and label.
+- If the calculation payload stores segment metrics as objects, use the contribution or
+  attribution percentage field for the segment value.
+- `attributed_banks` controls which banks sit under the gray
+  "Attributed Growth/Contribution" banner. Omit it to use the default banner placement.
+""".strip()
+
+
+def segment_key_from_name(name: Any) -> str:
+    text = str(name or "").strip()
+    default_lookup = {
+        normalize_text(segment["key"]): segment["key"] for segment in DEFAULT_CONFIG["segments"]
+    }
+    default_lookup.update(
+        {normalize_text(segment["label"]): segment["key"] for segment in DEFAULT_CONFIG["segments"]}
+    )
+    if normalize_text(text) in default_lookup:
+        return default_lookup[normalize_text(text)]
+    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").upper()
+
+
+def normalize_formatted_segments(formatted: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_segments = formatted.get("segments") or formatted.get("segment_names")
+    if not raw_segments:
+        return deepcopy(DEFAULT_CONFIG["segments"])
+    if isinstance(raw_segments, dict):
+        raw_segments = [
+            {"key": key, **value} if isinstance(value, dict) else {"key": key, "label": value}
+            for key, value in raw_segments.items()
+        ]
+
     segments = []
-    for offset in range(INPUT_LAYOUT["segment_max_rows"]):
-        row = INPUT_LAYOUT["segment_start_row"] + offset
-        key = cell(f"A{row}")
-        if key:
-            segments.append({"key": str(key).strip(), "label": cell(f"B{row}") or str(key).strip()})
-    if segments:
-        config["segments"] = segments
-    active_segments = config.get("segments", DEFAULT_CONFIG["segments"])
+    for raw_segment in raw_segments:
+        if isinstance(raw_segment, dict):
+            label = first_present(
+                raw_segment.get("label"),
+                raw_segment.get("name"),
+                raw_segment.get("segment"),
+                raw_segment.get("key"),
+            )
+            key = raw_segment.get("key") or segment_key_from_name(label)
+            override = raw_segment
+        else:
+            label = raw_segment
+            key = segment_key_from_name(label)
+            override = {}
 
-    rows = []
-    for offset in range(INPUT_LAYOUT["data_max_rows"]):
-        row_number = INPUT_LAYOUT["data_start_row"] + offset
-        bank = cell(f"A{row_number}")
-        if not bank:
+        defaults = next(
+            (
+                segment
+                for segment in DEFAULT_CONFIG["segments"]
+                if segment["key"] == key or normalize_text(segment["label"]) == normalize_text(label)
+            ),
+            {},
+        )
+        merged = deepcopy(defaults)
+        merged.update(override)
+        merged["key"] = key
+        merged["label"] = str(label or key)
+        merged.setdefault("color", DEFAULT_CONFIG["segments"][len(segments) % len(DEFAULT_CONFIG["segments"])]["color"])
+        merged.setdefault(
+            "textColor",
+            DEFAULT_CONFIG["segments"][len(segments) % len(DEFAULT_CONFIG["segments"])]["textColor"],
+        )
+        segments.append(merged)
+    return segments
+
+
+def segment_contribution_value(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    return first_present(
+        value.get("contribution_pct"),
+        value.get("attribution_pct"),
+        value.get("attributed_pct"),
+        value.get("contribution"),
+        value.get("pct"),
+        value.get("value"),
+        value.get("yoy_pct"),
+    )
+
+
+def iter_formatted_bank_records(formatted: dict[str, Any]) -> list[dict[str, Any]]:
+    banks = formatted.get("banks") or formatted.get("data") or []
+    if isinstance(banks, dict):
+        return [
+            {"bank": bank_name, **(bank_data or {})}
+            for bank_name, bank_data in banks.items()
+            if bank_data is not None
+        ]
+    return [record for record in banks if isinstance(record, dict)]
+
+
+def from_formatted(formatted: dict[str, Any]) -> dict[str, Any]:
+    """Convert LLM-formatted JSON into the internal workbook config."""
+    if not isinstance(formatted, dict):
+        raise TypeError("formatted must be a dict")
+
+    segments = normalize_formatted_segments(formatted)
+    segment_lookup = {
+        normalize_text(segment["key"]): segment["key"] for segment in segments
+    }
+    segment_lookup.update({normalize_text(segment["label"]): segment["key"] for segment in segments})
+    raw_attributed_banks = formatted.get("attributed_banks", formatted.get("attributedBanks")) or []
+    attributed_banks = {canonical_bank_name(bank) for bank in raw_attributed_banks}
+
+    banks = []
+    for record in iter_formatted_bank_records(formatted):
+        bank_name = first_present(record.get("bank"), record.get("bank_name"), record.get("name"))
+        if not bank_name:
             continue
-        row = {
-            "bank": bank,
-            "absoluteGrowthBn": cell(f"B{row_number}"),
-            "totalGrowthPct": cell(f"C{row_number}"),
-        }
-        for index, segment in enumerate(active_segments):
-            col = xlsxwriter.utility.xl_col_to_name(INPUT_LAYOUT["data_segment_start_col"] + index)
-            row[segment["key"]] = cell(f"{col}{row_number}")
-        rows.append(row)
 
-    return {**config, "bankOrder": [row["bank"] for row in rows], "data": rows}
+        totals = record.get("totals") or record.get("total") or {}
+        raw_segments = (
+            record.get("segments")
+            or record.get("segment_contributions")
+            or record.get("segmentContributions")
+            or {}
+        )
+        segment_values: dict[str, float] = {}
+        if isinstance(raw_segments, dict):
+            segment_items = raw_segments.items()
+        else:
+            segment_items = [
+                (
+                    first_present(item.get("segment"), item.get("segment_name"), item.get("name"), item.get("key")),
+                    item,
+                )
+                for item in raw_segments
+                if isinstance(item, dict)
+            ]
+        for raw_segment_name, raw_segment_value in segment_items:
+            segment_key = segment_lookup.get(
+                normalize_text(raw_segment_name), segment_key_from_name(raw_segment_name)
+            )
+            segment_values[segment_key] = to_number(segment_contribution_value(raw_segment_value))
+
+        bank = {
+            "bank": bank_name,
+            "absoluteGrowthBn": to_number(
+                first_present(
+                    record.get("absoluteGrowthBn"),
+                    record.get("absolute_growth"),
+                    record.get("absolute_growth_bn"),
+                    record.get("absoluteGrowth"),
+                    totals.get("absolute_growth"),
+                    totals.get("absolute_growth_bn"),
+                    totals.get("absoluteGrowthBn"),
+                )
+            ),
+            "totalGrowthPct": to_number(
+                first_present(
+                    record.get("totalGrowthPct"),
+                    record.get("yoy_pct"),
+                    record.get("yoy_growth"),
+                    record.get("reported_yoy_growth"),
+                    totals.get("yoy_pct"),
+                    totals.get("yoy_growth"),
+                    totals.get("totalGrowthPct"),
+                )
+            ),
+            "segments": segment_values,
+        }
+        for optional_key in ("shortName", "brandColor", "logoPath", "logoFile"):
+            snake_key = re.sub(r"([A-Z])", r"_\1", optional_key).lower()
+            optional_value = first_present(record.get(optional_key), record.get(snake_key))
+            if optional_value not in (None, ""):
+                bank[optional_key] = optional_value
+        if attributed_banks:
+            bank["attributed"] = canonical_bank_name(bank_name) in attributed_banks
+        elif "attributed" in record:
+            bank["attributed"] = to_bool(record["attributed"])
+        banks.append(bank)
+
+    config = {
+        "sectionNumber": str(
+            first_present(
+                formatted.get("sectionNumber"),
+                formatted.get("section_number"),
+                DEFAULT_CONFIG["sectionNumber"],
+            )
+        ),
+        "sectionTitle": first_present(
+            formatted.get("sectionTitle"),
+            formatted.get("section_title"),
+            DEFAULT_CONFIG["sectionTitle"],
+        ),
+        "sheetName": first_present(
+            formatted.get("sheetName"),
+            formatted.get("sheet_name"),
+            DEFAULT_CONFIG["sheetName"],
+        ),
+        "attributedLabel": first_present(
+            formatted.get("attributedLabel"),
+            formatted.get("attributed_label"),
+            DEFAULT_CONFIG["attributedLabel"],
+        ),
+        "segments": segments,
+        "bankOrder": [
+            canonical_bank_name(bank)
+            for bank in first_present(
+                formatted.get("bankOrder"),
+                formatted.get("bank_order"),
+                [bank["bank"] for bank in banks],
+            )
+        ],
+        "banks": banks,
+    }
+    return prepare_config(config)
 
 
 def load_config(input_path: Path | None) -> dict[str, Any]:
     if not input_path:
         return prepare_config({})
-    if input_path.suffix.lower() == ".xlsx":
-        return prepare_config(load_config_from_input_workbook(input_path))
-    return prepare_config(json.loads(input_path.read_text()))
+    parsed = json.loads(input_path.read_text())
+    formatted_keys = {
+        "section_number",
+        "section_title",
+        "sheet_name",
+        "segment_names",
+        "attributed_banks",
+    }
+    if formatted_keys.intersection(parsed):
+        return from_formatted(parsed)
+    return prepare_config(parsed)
 
 
 def safe_sheet_name(config: dict[str, Any]) -> str:
@@ -424,11 +613,6 @@ def section_header(config: dict[str, Any]) -> str:
 def segment_value(bank: dict[str, Any], segment_key: str) -> float:
     value = bank.get("segments", {}).get(segment_key, 0)
     return float(value) if isinstance(value, (int, float)) else 0
-
-
-def abs_growth_label(value: float) -> str:
-    sign = "+" if value >= 0 else "-"
-    return f"{sign}{abs(value):.1f}BN"
 
 
 def pct_label(value: float) -> str:
@@ -534,8 +718,17 @@ def make_formats(workbook: xlsxwriter.Workbook) -> dict[str, Any]:
                 "valign": "vcenter",
             }
         ),
-        "top_abs": workbook.add_format({"bold": True, "font_size": 17, "align": "center"}),
-        "top_pct": workbook.add_format({"bold": True, "font_size": 15, "align": "center"}),
+        "top_abs": workbook.add_format(
+            {
+                "bold": True,
+                "font_size": 17,
+                "align": "center",
+                "num_format": '+0.0"BN";-0.0"BN";0.0"BN"',
+            }
+        ),
+        "top_pct": workbook.add_format(
+            {"bold": True, "font_size": 15, "align": "center", "num_format": '0"%"'}
+        ),
         "attributed": workbook.add_format(
             {
                 "bold": True,
@@ -552,12 +745,6 @@ def make_formats(workbook: xlsxwriter.Workbook) -> dict[str, Any]:
         "source": workbook.add_format({"font_size": 9}),
         "source_bn": workbook.add_format({"font_size": 9, "num_format": '+0.0"BN";-0.0"BN";0.0"BN"'}),
         "source_pct": workbook.add_format({"font_size": 9, "num_format": '0"%"'}),
-        "input_header": workbook.add_format(
-            {"bold": True, "font_color": "#FFFFFF", "bg_color": "#0D6786"}
-        ),
-        "input_label": workbook.add_format({"bold": True, "font_color": "#111827", "bg_color": "#D9EAF7"}),
-        "input_bn": workbook.add_format({"num_format": '+0.0"BN";-0.0"BN";0.0"BN"'}),
-        "input_pct": workbook.add_format({"num_format": '0"%"'}),
     }
 
 
@@ -589,10 +776,10 @@ def write_source_table(
     rows = [
         [
             bank["bank"],
-            "" if config.get("templateMode") else bank["absoluteGrowthBn"],
-            "" if config.get("templateMode") else bank["totalGrowthPct"],
+            bank["absoluteGrowthBn"],
+            bank["totalGrowthPct"],
             *[
-                "" if config.get("templateMode") else segment_value(bank, segment["key"])
+                segment_value(bank, segment["key"])
                 for segment in config["segments"]
             ],
         ]
@@ -933,24 +1120,32 @@ def write_attributed_growth_workbook(config: dict[str, Any], output_path: Path) 
         last = CENTER_COLS[attributed[-1][1]] + 1
         worksheet.merge_range(1, first, 1, last, config["attributedLabel"], formats["attributed"])
 
+    source_bounds = write_source_table(workbook, worksheet, config, formats)
+    source_start_row, source_start_col, _source_end_row, _source_end_col = source_bounds
+
     for index, bank in enumerate(config["banks"]):
         if index >= len(CENTER_COLS):
             continue
         col = CENTER_COLS[index]
-        worksheet.write(
+        source_row = source_start_row + 1 + index
+        abs_cell = xlsxwriter.utility.xl_rowcol_to_cell(source_row, source_start_col + 1)
+        pct_cell = xlsxwriter.utility.xl_rowcol_to_cell(source_row, source_start_col + 2)
+        abs_value = bank["absoluteGrowthBn"]
+        pct_value = bank["totalGrowthPct"]
+        worksheet.write_formula(
             LAYOUT["absolute_label_row"],
             col,
-            "" if config.get("templateMode") else abs_growth_label(bank["absoluteGrowthBn"]),
+            f'=IF({abs_cell}="","",{abs_cell})',
             formats["top_abs"],
+            abs_value,
         )
-        worksheet.write(
+        worksheet.write_formula(
             LAYOUT["total_label_row"],
             col,
-            "" if config.get("templateMode") else pct_label(bank["totalGrowthPct"]),
+            f'=IF({pct_cell}="","",{pct_cell})',
             formats["top_pct"],
+            pct_value,
         )
-
-    source_bounds = write_source_table(workbook, worksheet, config, formats)
 
     chart_values_start_col = write_native_chart_helper_values(worksheet, config, source_bounds)
     overlay_label_helper_start_col = write_overlay_label_helper_values(
@@ -1017,125 +1212,26 @@ def write_attributed_growth_workbook(config: dict[str, Any], output_path: Path) 
         workbook.close()
 
 
-def write_input_template_workbook(config: dict[str, Any], output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    workbook = xlsxwriter.Workbook(output_path)
-    worksheet = workbook.add_worksheet(INPUT_LAYOUT["sheet_name"])
-    formats = make_formats(workbook)
-    for col, width in enumerate([140, 126, 126, 70, 70, 70, 70, 70]):
-        worksheet.set_column_pixels(col, col, width)
-
-    worksheet.write_row(0, 0, ["Section Number", config["sectionNumber"]])
-    worksheet.write_row(1, 0, ["Section Title", config["sectionTitle"]])
-    worksheet.write(0, 0, "Section Number", formats["input_label"])
-    worksheet.write(1, 0, "Section Title", formats["input_label"])
-
-    segment_header_row = INPUT_LAYOUT["segment_start_row"] - 2
-    segment_rows = [[segment["key"], segment["label"]] for segment in config["segments"]]
-    worksheet.add_table(
-        segment_header_row,
-        0,
-        segment_header_row + len(segment_rows),
-        1,
-        {
-            "name": "AttributedGrowthSegmentsInput",
-            "style": "Table Style Medium 2",
-            "data": segment_rows,
-            "columns": [{"header": "Segment Key"}, {"header": "Segment Label"}],
-        },
-    )
-    worksheet.write_row(segment_header_row, 0, ["Segment Key", "Segment Label"], formats["input_header"])
-
-    data_headers = [
-        "Bank",
-        "Absolute Growth ($BN)",
-        "Reported YoY Growth",
-        *[segment["key"] for segment in config["segments"]],
-    ]
-    data_rows = [
-        [
-            bank["bank"],
-            bank["absoluteGrowthBn"],
-            bank["totalGrowthPct"],
-            *[segment_value(bank, segment["key"]) for segment in config["segments"]],
-        ]
-        for bank in config["banks"]
-    ]
-    data_header_row = INPUT_LAYOUT["data_start_row"] - 2
-    worksheet.add_table(
-        data_header_row,
-        0,
-        data_header_row + len(data_rows),
-        len(data_headers) - 1,
-        {
-            "name": "AttributedGrowthBankDataInput",
-            "style": "Table Style Medium 2",
-            "data": data_rows,
-            "columns": [{"header": header} for header in data_headers],
-        },
-    )
-    worksheet.write_row(data_header_row, 0, data_headers, formats["input_header"])
-    for row_offset, row in enumerate(data_rows, start=1):
-        for col_offset, value in enumerate(row):
-            fmt = None
-            if col_offset == 1:
-                fmt = formats["input_bn"]
-            elif col_offset >= 2:
-                fmt = formats["input_pct"]
-            worksheet.write(data_header_row + row_offset, col_offset, value, fmt)
-    workbook.close()
-
-
-def blank_template_config() -> dict[str, Any]:
-    segments = deepcopy(DEFAULT_CONFIG["segments"])
-    empty_segments = {segment["key"]: 0 for segment in segments}
-    return prepare_config(
-        {
-            "banks": [
-                {
-                    **deepcopy(bank),
-                    "absoluteGrowthBn": 0,
-                    "totalGrowthPct": 0,
-                    "segments": deepcopy(empty_segments),
-                }
-                for bank in DEFAULT_CONFIG["banks"]
-            ],
-            "segments": segments,
-            "templateMode": True,
-        }
-    )
+def write_workbook(
+    config: dict[str, Any], output_path: Path, supporting_data: Any | None = None
+) -> None:
+    """Pipeline entry point: render an XLSX workbook from an internal config dict."""
+    _ = supporting_data
+    write_attributed_growth_workbook(prepare_config(config), Path(output_path))
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build attributed growth by segment template.")
+    parser = argparse.ArgumentParser(description="Build attributed growth by segment workbook.")
     parser.add_argument("--input", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--create-input-template", nargs="?", const=True)
-    parser.add_argument("--create-blank-template", nargs="?", const=True)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.create_input_template:
-        output = (
-            Path(args.create_input_template)
-            if isinstance(args.create_input_template, str)
-            else DEFAULT_INPUT_PATH
-        )
-        write_input_template_workbook(prepare_config({}), output.resolve())
-        print(output.resolve())
-        return
-
-    if isinstance(args.create_blank_template, str):
-        output = Path(args.create_blank_template)
-    elif args.output:
-        output = args.output
-    else:
-        output = DEFAULT_OUTPUT_PATH
-    input_path = args.input or (None if args.create_blank_template else DEFAULT_INPUT_PATH)
-    config = blank_template_config() if args.create_blank_template else load_config(input_path)
-    write_attributed_growth_workbook(config, output.resolve())
+    output = args.output or DEFAULT_OUTPUT_PATH
+    config = load_config(args.input)
+    write_workbook(config, output.resolve())
     print(output.resolve())
 
 
