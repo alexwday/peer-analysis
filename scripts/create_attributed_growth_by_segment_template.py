@@ -46,6 +46,8 @@ DEFAULT_LOGO_FILES = {
     "National Bank": "na.png",
     "TD": "td.png",
 }
+NATIVE_ZERO_SLIVER_VALUE = 0.1
+OVERLAY_LABEL_OFFSETS = [-0.1, 0.1, 0, 0.08, -0.08]
 CENTER_COLS = [2, 4, 6, 8, 10, 12]
 LAYOUT = {
     "absolute_label_row": 3,
@@ -57,14 +59,7 @@ LAYOUT = {
     "source_table_start_row": 3,
 }
 CHART_GEOMETRY = {
-    "top_row": 5,
-    "bottom_row": 29,
-    "bar_width_px": 92,
-    "label_width_px": 54,
-    "label_height_px": 21,
     "axis_max_padding": 1.03,
-    "bar_overlap_px": 1.0,
-    "zero_marker_height_px": 4,
     "zero_line_color": "#8C8C8C",
 }
 INPUT_LAYOUT = {
@@ -454,10 +449,6 @@ def column_width_px(column_index: int) -> int:
     return COLUMN_WIDTHS_PX.get(column_index, 64)
 
 
-def row_top_px(row_index: int) -> int:
-    return sum(row_height_px(row) for row in range(row_index))
-
-
 def column_left_px(column_index: int) -> int:
     return sum(column_width_px(col) for col in range(column_index))
 
@@ -467,15 +458,6 @@ def category_center_px(bank_index: int) -> float:
     return column_left_px(column) + column_width_px(column) / 2
 
 
-def pixel_to_row_anchor(y_px: float) -> tuple[int, int]:
-    row = 0
-    remaining = max(0, float(y_px))
-    while remaining >= row_height_px(row):
-        remaining -= row_height_px(row)
-        row += 1
-    return row, round(remaining)
-
-
 def pixel_to_col_anchor(x_px: float) -> tuple[int, int]:
     col = 0
     remaining = max(0, float(x_px))
@@ -483,44 +465,6 @@ def pixel_to_col_anchor(x_px: float) -> tuple[int, int]:
         remaining -= column_width_px(col)
         col += 1
     return col, round(remaining)
-
-
-def textbox_at_px(
-    worksheet: xlsxwriter.worksheet.Worksheet,
-    x_px: float,
-    y_px: float,
-    width_px: float,
-    height_px: float,
-    text: str = "",
-    *,
-    fill_color: str | None = "#FFFFFF",
-    line_color: str | None = None,
-    font_color: str = "#000000",
-    font_size: int = 11,
-    bold: bool = True,
-    object_position: int = 2,
-) -> None:
-    row, y_offset = pixel_to_row_anchor(y_px)
-    col, x_offset = pixel_to_col_anchor(x_px)
-    options: dict[str, Any] = {
-        "x_offset": x_offset,
-        "y_offset": y_offset,
-        "width": max(1, round(width_px)),
-        "height": max(1, round(height_px)),
-        "object_position": object_position,
-        "align": {"horizontal": "center", "vertical": "middle"},
-        "font": {"color": font_color, "size": font_size, "bold": bold},
-        "margin": 0,
-    }
-    if fill_color is None:
-        options["fill"] = {"none": True}
-    else:
-        options["fill"] = {"color": fill_color}
-    if line_color is None:
-        options["line"] = {"none": True}
-    else:
-        options["line"] = {"color": line_color}
-    worksheet.insert_textbox(row, col, text, options)
 
 
 def resolve_logo_path(bank: dict[str, Any], config: dict[str, Any]) -> Path | None:
@@ -641,7 +585,6 @@ def write_source_table(
         "Absolute Growth ($BN)",
         "Reported YoY Growth",
         *[segment["label"] for segment in config["segments"]],
-        "Attributed",
     ]
     rows = [
         [
@@ -652,7 +595,6 @@ def write_source_table(
                 "" if config.get("templateMode") else segment_value(bank, segment["key"])
                 for segment in config["segments"]
             ],
-            "Yes" if bank.get("attributed") else "",
         ]
         for bank in config["banks"]
     ]
@@ -686,32 +628,162 @@ def write_source_table(
     return start_row, start_col, end_row, end_col
 
 
+def write_native_chart_helper_values(
+    worksheet: xlsxwriter.worksheet.Worksheet,
+    config: dict[str, Any],
+    source_bounds: tuple[int, int, int, int],
+) -> int:
+    start_row, start_col, end_row, end_col = source_bounds
+    helper_start_col = end_col + 2
+
+    for index, segment in enumerate(config["segments"]):
+        helper_col = helper_start_col + index
+        source_col = start_col + 3 + index
+        worksheet.write(start_row, helper_col, f"{segment['label']} Chart Value")
+        for row in range(start_row + 1, end_row + 1):
+            source_cell = xlsxwriter.utility.xl_rowcol_to_cell(row, source_col)
+            source_value = segment_value(config["banks"][row - start_row - 1], segment["key"])
+            helper_value = NATIVE_ZERO_SLIVER_VALUE if source_value == 0 else source_value
+            worksheet.write_formula(
+                row,
+                helper_col,
+                f'=IF({source_cell}="",NA(),IF({source_cell}=0,{NATIVE_ZERO_SLIVER_VALUE},{source_cell}))',
+                None,
+                helper_value,
+            )
+
+    worksheet.set_column(helper_start_col, helper_start_col + len(config["segments"]) - 1, None, None, {"hidden": True})
+    return helper_start_col
+
+
+def sheet_formula(sheet_name: str, row: int, col: int) -> str:
+    cell = xlsxwriter.utility.xl_rowcol_to_cell(row, col, row_abs=True, col_abs=True)
+    return f"'{sheet_name}'!{cell}"
+
+
+def write_overlay_label_helper_values(
+    worksheet: xlsxwriter.worksheet.Worksheet,
+    sheet_name: str,
+    config: dict[str, Any],
+    source_bounds: tuple[int, int, int, int],
+    chart_values_start_col: int,
+) -> int:
+    start_row, start_col, end_row, end_col = source_bounds
+    helper_start_col = chart_values_start_col + len(config["segments"]) + 2
+    source_segment_start_col = start_col + 3
+
+    for segment_index, segment in enumerate(config["segments"]):
+        x_col = helper_start_col + segment_index * 3
+        y_col = x_col + 1
+        label_col = x_col + 2
+        worksheet.write(start_row, x_col, f"{segment['label']} Label X")
+        worksheet.write(start_row, y_col, f"{segment['label']} Label Y")
+        worksheet.write(start_row, label_col, f"{segment['label']} Label")
+
+        chart_col = chart_values_start_col + segment_index
+        source_col = source_segment_start_col + segment_index
+        x_offset = OVERLAY_LABEL_OFFSETS[segment_index % len(OVERLAY_LABEL_OFFSETS)]
+
+        for row in range(start_row + 1, end_row + 1):
+            bank_number = row - start_row
+            source_cell = xlsxwriter.utility.xl_rowcol_to_cell(row, source_col)
+            chart_cell = xlsxwriter.utility.xl_rowcol_to_cell(row, chart_col)
+
+            if segment_index == 0:
+                prev_pos = "0"
+                prev_neg = "0"
+            else:
+                prev_first = xlsxwriter.utility.xl_rowcol_to_cell(row, chart_values_start_col)
+                prev_last = xlsxwriter.utility.xl_rowcol_to_cell(
+                    row, chart_values_start_col + segment_index - 1
+                )
+                prev_range = f"{prev_first}:{prev_last}"
+                prev_pos = f'SUMIF({prev_range},">0",{prev_range})'
+                prev_neg = f'SUMIF({prev_range},"<0",{prev_range})'
+
+            source_value = segment_value(config["banks"][row - start_row - 1], segment["key"])
+            chart_value = NATIVE_ZERO_SLIVER_VALUE if source_value == 0 else source_value
+            cached_y = (
+                sum(
+                    max(
+                        0,
+                        NATIVE_ZERO_SLIVER_VALUE
+                        if segment_value(config["banks"][row - start_row - 1], previous["key"]) == 0
+                        else segment_value(config["banks"][row - start_row - 1], previous["key"]),
+                    )
+                    for previous in config["segments"][:segment_index]
+                )
+                + chart_value / 2
+                if chart_value >= 0
+                else sum(
+                    min(
+                        0,
+                        NATIVE_ZERO_SLIVER_VALUE
+                        if segment_value(config["banks"][row - start_row - 1], previous["key"]) == 0
+                        else segment_value(config["banks"][row - start_row - 1], previous["key"]),
+                    )
+                    for previous in config["segments"][:segment_index]
+                )
+                + chart_value / 2
+            )
+            cached_x = bank_number + (x_offset if 0 <= abs(source_value) <= 1 else 0)
+            cached_label = "" if source_value == "" else pct_label(source_value)
+
+            worksheet.write_formula(
+                row,
+                x_col,
+                f'=IF({source_cell}="",NA(),{bank_number}+IF(AND(ABS({source_cell})<=1,{source_cell}>=0),{x_offset},0))',
+                None,
+                cached_x,
+            )
+            worksheet.write_formula(
+                row,
+                y_col,
+                f'=IF({source_cell}="",NA(),IF({chart_cell}>=0,{prev_pos}+{chart_cell}/2,{prev_neg}+{chart_cell}/2))',
+                None,
+                cached_y,
+            )
+            worksheet.write_formula(
+                row,
+                label_col,
+                f'=IF({source_cell}="","",ROUND({source_cell},0)&"%")',
+                None,
+                cached_label,
+            )
+
+    worksheet.set_column(
+        helper_start_col,
+        helper_start_col + len(config["segments"]) * 3 - 1,
+        None,
+        None,
+        {"hidden": True},
+    )
+    return helper_start_col
+
+
 def add_native_chart(
     workbook: xlsxwriter.Workbook,
     worksheet: xlsxwriter.worksheet.Worksheet,
     sheet_name: str,
     config: dict[str, Any],
     source_bounds: tuple[int, int, int, int],
+    chart_values_start_col: int,
+    overlay_label_helper_start_col: int,
 ) -> None:
     start_row, start_col, end_row, _end_col = source_bounds
     chart = workbook.add_chart({"type": "column", "subtype": "stacked"})
     chart.show_hidden_data()
     category_range = [sheet_name, start_row + 1, start_col, end_row, start_col]
     for index, segment in enumerate(config["segments"]):
-        col = start_col + 3 + index
+        name_col = start_col + 3 + index
+        values_col = chart_values_start_col + index
         chart.add_series(
             {
-                "name": [sheet_name, start_row, col],
+                "name": [sheet_name, start_row, name_col],
                 "categories": category_range,
-                "values": [sheet_name, start_row + 1, col, end_row, col],
+                "values": [sheet_name, start_row + 1, values_col, end_row, values_col],
                 "fill": {"color": segment["color"]},
-                "border": {"color": "#FFFFFF"},
-                "data_labels": {
-                    "value": True,
-                    "position": "center",
-                    "num_format": '0"%"',
-                    "font": {"color": segment.get("textColor", "#FFFFFF"), "size": 12},
-                },
+                "border": {"color": segment["color"]},
             }
         )
     extents = segment_stack_extents(config)
@@ -720,13 +792,25 @@ def add_native_chart(
     chart.set_title({"none": True})
     chart.set_legend({"none": True})
     chart.set_chartarea({"fill": {"color": "#FFFFFF"}, "border": {"none": True}})
-    chart.set_plotarea({"fill": {"color": "#FFFFFF"}, "border": {"none": True}})
+    chart.set_plotarea(
+        {
+            "fill": {"color": "#FFFFFF"},
+            "border": {"none": True},
+            "layout": {
+                "x": 0.06135,
+                "y": 0.07,
+                "width": 0.8834,
+                "height": 0.92,
+            },
+        }
+    )
     chart.set_x_axis(
         {
-            "visible": False,
             "major_gridlines": {"visible": False},
-            "line": {"none": True},
-            "num_font": {"color": "#FFFFFF"},
+            "major_tick_mark": "none",
+            "minor_tick_mark": "none",
+            "line": {"color": CHART_GEOMETRY["zero_line_color"], "width": 1.25},
+            "num_font": {"color": "#FFFFFF", "size": 1},
         }
     )
     chart.set_y_axis(
@@ -739,186 +823,76 @@ def add_native_chart(
             "line": {"none": True},
         }
     )
-    chart.set_size({"width": 980, "height": 470})
+    chart.set_size({"width": column_left_px(15), "height": 470})
     chart.series_gap_1 = 70
     chart.series_gap_2 = 70
     chart.series_overlap_1 = 100
     chart.series_overlap_2 = 100
-    worksheet.insert_chart(LAYOUT["chart_top_row"], LAYOUT["chart_top_col"], chart)
 
-
-def chart_axis_geometry(config: dict[str, Any]) -> dict[str, float]:
-    extents = segment_stack_extents(config)
-    axis_max = max(1, extents["positive"] * CHART_GEOMETRY["axis_max_padding"])
-    axis_min = -max(1.5, extents["negative"] * 1.5) if extents["negative"] > 0 else 0
-    plot_top = row_top_px(CHART_GEOMETRY["top_row"])
-    plot_bottom = row_top_px(CHART_GEOMETRY["bottom_row"])
-    unit_px = (plot_bottom - plot_top) / (axis_max - axis_min)
-    baseline = plot_top + axis_max * unit_px
-    first_center = category_center_px(0)
-    last_center = category_center_px(len(config["banks"]) - 1)
-    bar_width = CHART_GEOMETRY["bar_width_px"]
-    return {
-        "plot_top": plot_top,
-        "plot_bottom": plot_bottom,
-        "unit_px": unit_px,
-        "baseline": baseline,
-        "line_left": first_center - bar_width / 2 - 42,
-        "line_right": last_center + bar_width / 2 + 42,
+    label_chart = workbook.add_chart({"type": "scatter", "subtype": "marker_only"})
+    label_chart.show_hidden_data()
+    for segment_index, segment in enumerate(config["segments"]):
+        x_col = overlay_label_helper_start_col + segment_index * 3
+        y_col = x_col + 1
+        label_col = x_col + 2
+        custom_labels = []
+        for row in range(start_row + 1, end_row + 1):
+            custom_labels.append(
+                {
+                    "formula": sheet_formula(sheet_name, row, label_col),
+                    "data": [
+                        pct_label(
+                            segment_value(config["banks"][row - start_row - 1], segment["key"])
+                        )
+                    ],
+                }
+            )
+        label_chart.add_series(
+            {
+                "categories": [sheet_name, start_row + 1, x_col, end_row, x_col],
+                "values": [sheet_name, start_row + 1, y_col, end_row, y_col],
+                "x2_axis": True,
+                "y2_axis": True,
+                "marker": {"type": "none"},
+                "line": {"none": True},
+                "data_labels": {
+                    "custom": custom_labels,
+                    "position": "center",
+                    "font": {
+                        "color": segment.get("textColor", "#FFFFFF"),
+                        "size": 12,
+                        "bold": True,
+                    },
+                    "fill": {"color": segment["color"]},
+                    "border": {"color": segment["color"]},
+                },
+            }
+        )
+    hidden_axis = {
+        "visible": False,
+        "major_gridlines": {"visible": False},
+        "line": {"none": True},
+        "num_font": {"color": "#FFFFFF", "size": 1},
     }
-
-
-def stagger_label_positions(labels: list[dict[str, Any]]) -> None:
-    labels.sort(key=lambda label: label["center_y"])
-    cluster: list[dict[str, Any]] = []
-    min_gap = CHART_GEOMETRY["label_height_px"] + 2
-
-    def apply_cluster_offsets(cluster_labels: list[dict[str, Any]]) -> None:
-        if len(cluster_labels) <= 1:
-            return
-        offsets = [-22, 22, 0, -34, 34]
-        for index, label in enumerate(cluster_labels):
-            label["x_shift"] = offsets[index % len(offsets)]
-
-    for label in labels:
-        if not cluster:
-            cluster = [label]
-            continue
-        if label["center_y"] - cluster[-1]["center_y"] < min_gap:
-            cluster.append(label)
-        else:
-            apply_cluster_offsets(cluster)
-            cluster = [label]
-    apply_cluster_offsets(cluster)
-
-
-def draw_manual_chart(
-    worksheet: xlsxwriter.worksheet.Worksheet, config: dict[str, Any]
-) -> None:
-    geometry = chart_axis_geometry(config)
-    bar_width = CHART_GEOMETRY["bar_width_px"]
-    label_width = CHART_GEOMETRY["label_width_px"]
-    label_height = CHART_GEOMETRY["label_height_px"]
-    bar_overlap = CHART_GEOMETRY["bar_overlap_px"]
-    zero_marker_height = CHART_GEOMETRY["zero_marker_height_px"]
-    all_labels: list[dict[str, Any]] = []
-
-    if config.get("templateMode"):
-        textbox_at_px(
-            worksheet,
-            geometry["line_left"],
-            geometry["baseline"] - 1,
-            geometry["line_right"] - geometry["line_left"],
-            2,
-            fill_color=CHART_GEOMETRY["zero_line_color"],
-        )
-        return
-
-    for bank_index, bank in enumerate(config["banks"]):
-        if bank_index >= len(CENTER_COLS):
-            continue
-        center_x = category_center_px(bank_index)
-        left_x = center_x - bar_width / 2
-        positive_stack = 0.0
-        negative_stack = 0.0
-        bank_labels: list[dict[str, Any]] = []
-        zero_marker_counts: dict[int, int] = {}
-
-        for segment in config["segments"]:
-            value = segment_value(bank, segment["key"])
-            fill = segment["color"]
-            text_color = segment.get("textColor", "#FFFFFF")
-
-            if value == 0:
-                marker_base = (
-                    geometry["baseline"] - positive_stack * geometry["unit_px"]
-                    if positive_stack > 0
-                    else geometry["baseline"] + negative_stack * geometry["unit_px"]
-                )
-                marker_key = round(marker_base)
-                marker_count = zero_marker_counts.get(marker_key, 0)
-                zero_marker_counts[marker_key] = marker_count + 1
-                marker_y = marker_base + marker_count * (zero_marker_height + 1)
-                textbox_at_px(
-                    worksheet,
-                    left_x,
-                    marker_y - zero_marker_height / 2,
-                    bar_width,
-                    zero_marker_height,
-                    fill_color=fill,
-                    line_color=fill,
-                )
-                bank_labels.append(
-                    {
-                        "text": "0%",
-                        "fill": fill,
-                        "text_color": text_color,
-                        "center_x": center_x,
-                        "center_y": marker_y,
-                        "x_shift": 0,
-                    }
-                )
-                continue
-
-            height = max(1, abs(value) * geometry["unit_px"])
-            top_y = (
-                geometry["baseline"] - (positive_stack + value) * geometry["unit_px"]
-                if value > 0
-                else geometry["baseline"] + negative_stack * geometry["unit_px"]
-            )
-            draw_height = height + bar_overlap
-            textbox_at_px(
-                worksheet,
-                left_x,
-                top_y,
-                bar_width,
-                draw_height,
-                fill_color=fill,
-                line_color=fill,
-            )
-            rounded = round(value)
-            if rounded != 0:
-                bank_labels.append(
-                    {
-                        "text": pct_label(value),
-                        "fill": fill,
-                        "text_color": text_color,
-                        "center_x": center_x,
-                        "center_y": top_y + height / 2,
-                        "x_shift": 0,
-                    }
-                )
-            if value > 0:
-                positive_stack += value
-            else:
-                negative_stack += abs(value)
-
-        stagger_label_positions(bank_labels)
-        all_labels.extend(bank_labels)
-
-    textbox_at_px(
-        worksheet,
-        geometry["line_left"],
-        geometry["baseline"] - 1,
-        geometry["line_right"] - geometry["line_left"],
-        2,
-        fill_color=CHART_GEOMETRY["zero_line_color"],
+    label_chart.set_x2_axis(
+        {
+            **hidden_axis,
+            "min": 0.5,
+            "max": len(config["banks"]) + 0.5,
+            "major_unit": 1,
+        }
     )
+    label_chart.set_y2_axis(
+        {
+            **hidden_axis,
+            "min": axis_min,
+            "max": axis_max,
+            "major_unit": 5,
+        }
+    )
+    chart.combine(label_chart)
 
-    for label in all_labels:
-        textbox_at_px(
-            worksheet,
-            label["center_x"] - label_width / 2 + label["x_shift"],
-            label["center_y"] - label_height / 2,
-            label_width,
-            label_height,
-            label["text"],
-            fill_color=label["fill"],
-            line_color=label["fill"],
-            font_color=label["text_color"],
-            font_size=12,
-            bold=True,
-        )
+    worksheet.insert_chart(LAYOUT["chart_top_row"], LAYOUT["chart_top_col"], chart)
 
 
 def segment_stack_extents(config: dict[str, Any]) -> dict[str, float]:
@@ -978,10 +952,23 @@ def write_attributed_growth_workbook(config: dict[str, Any], output_path: Path) 
 
     source_bounds = write_source_table(workbook, worksheet, config, formats)
 
-    native_chart_sheet = workbook.add_worksheet("_Native Chart")
-    native_chart_sheet.hide()
-    add_native_chart(workbook, native_chart_sheet, sheet_name, config, source_bounds)
-    draw_manual_chart(worksheet, config)
+    chart_values_start_col = write_native_chart_helper_values(worksheet, config, source_bounds)
+    overlay_label_helper_start_col = write_overlay_label_helper_values(
+        worksheet,
+        sheet_name,
+        config,
+        source_bounds,
+        chart_values_start_col,
+    )
+    add_native_chart(
+        workbook,
+        worksheet,
+        sheet_name,
+        config,
+        source_bounds,
+        chart_values_start_col,
+        overlay_label_helper_start_col,
+    )
 
     with tempfile.TemporaryDirectory() as temp_dir_name:
         temp_dir = Path(temp_dir_name)
@@ -1140,12 +1127,12 @@ def main() -> None:
         print(output.resolve())
         return
 
-    output = (
-        Path(args.create_blank_template)
-        if isinstance(args.create_blank_template, str)
-        else args.output
-        or DEFAULT_OUTPUT_PATH
-    )
+    if isinstance(args.create_blank_template, str):
+        output = Path(args.create_blank_template)
+    elif args.output:
+        output = args.output
+    else:
+        output = DEFAULT_OUTPUT_PATH
     input_path = args.input or (None if args.create_blank_template else DEFAULT_INPUT_PATH)
     config = blank_template_config() if args.create_blank_template else load_config(input_path)
     write_attributed_growth_workbook(config, output.resolve())
